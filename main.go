@@ -1,4 +1,11 @@
-
+// Multipart Secret Management Script v2 (Go version)
+// This script implements a comprehensive approach for managing AWS Secrets Manager secrets.
+// Features:
+// - Add key-value pairs (bulk addition with full redistribution)
+// - Values can be simple strings or nested escaped JSON
+// - Automatic sorting of all keys alphabetically
+// - Automatic redistribution across multipart secrets
+// - 50KB limit per secret
 
 package main
 
@@ -73,14 +80,14 @@ func getMultipartNumbers(client *secretsmanager.Client, base string) ([]int, err
 	return numbers, nil
 }
 
-func getSecretData(client *secretsmanager.Client, name string) (map[string]string, error) {
+func getSecretData(client *secretsmanager.Client, name string) (map[string]interface{}, error) {
 	input := &secretsmanager.GetSecretValueInput{SecretId: aws.String(name)}
 	resp, err := client.GetSecretValue(context.Background(), input)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to get secret '%s': %v\n", name, err)
 		return nil, err
 	}
-	var m map[string]string
+	var m map[string]interface{}
 	if err := json.Unmarshal([]byte(aws.ToString(resp.SecretString)), &m); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to unmarshal secret '%s': %v\n", name, err)
 		return nil, err
@@ -88,8 +95,8 @@ func getSecretData(client *secretsmanager.Client, name string) (map[string]strin
 	return m, nil
 }
 
-func fetchAllSecretData(client *secretsmanager.Client, base string) (map[string]string, error) {
-	all := make(map[string]string)
+func fetchAllSecretData(client *secretsmanager.Client, base string) (map[string]interface{}, error) {
+	all := make(map[string]interface{})
 	numbers, err := getMultipartNumbers(client, base)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to get multipart numbers for '%s': %v\n", base, err)
@@ -117,7 +124,7 @@ func fetchAllSecretData(client *secretsmanager.Client, base string) (map[string]
 	return all, nil
 }
 
-func addKeyValues(all map[string]string, new map[string]string) error {
+func addKeyValues(all map[string]interface{}, new map[string]interface{}) error {
 	for k := range new {
 		if _, exists := all[k]; exists {
 			fmt.Fprintf(os.Stderr, "ERROR: Key already exists: %s\n", k)
@@ -130,23 +137,23 @@ func addKeyValues(all map[string]string, new map[string]string) error {
 	return nil
 }
 
-func sortDataAlphabetically(data map[string]string) map[string]string {
+func sortDataAlphabetically(data map[string]interface{}) map[string]interface{} {
 	keys := make([]string, 0, len(data))
 	for k := range data {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	sorted := make(map[string]string, len(data))
+	sorted := make(map[string]interface{}, len(data))
 	for _, k := range keys {
 		sorted[k] = data[k]
 	}
 	return sorted
 }
 
-// parseJSONInput parses JSON input and converts all values to strings.
-// Nested objects, arrays, numbers, and booleans are automatically marshaled to JSON strings.
-func parseJSONInput(jsonData string) (map[string]string, error) {
-	// Step 1: Validate JSON syntax (like 'jq') and accept any valid JSON structure
+// parseJSONInput parses JSON input and preserves the original structure.
+// Objects, arrays, strings, numbers, and booleans are kept in their native types.
+func parseJSONInput(jsonData string) (map[string]interface{}, error) {
+	// Validate JSON syntax and unmarshal into map[string]interface{}
 	var rawData map[string]interface{}
 	if err := json.Unmarshal([]byte(jsonData), &rawData); err != nil {
 		return nil, fmt.Errorf("invalid JSON data: %w", err)
@@ -156,27 +163,12 @@ func parseJSONInput(jsonData string) (map[string]string, error) {
 		return nil, fmt.Errorf("JSON data is empty")
 	}
 
-	// Step 2: Convert to map[string]string for internal processing
-	result := make(map[string]string)
-	for k, v := range rawData {
-		switch val := v.(type) {
-		case string:
-			result[k] = val
-		default:
-			// If the value is an object, array, number, or bool, marshal it to a string
-			js, err := json.Marshal(val)
-			if err != nil {
-				return nil, fmt.Errorf("failed to convert value for key '%s' to string: %w", k, err)
-			}
-			result[k] = string(js)
-		}
-	}
-
-	return result, nil
+	// Return the data as-is (no conversion to strings)
+	return rawData, nil
 }
 
 
-func chunkDataIntoSecrets(data map[string]string) []map[string]string {
+func chunkDataIntoSecrets(data map[string]interface{}) []map[string]interface{} {
 	// Extract and sort keys to ensure deterministic chunking
 	keys := make([]string, 0, len(data))
 	for k := range data {
@@ -184,12 +176,12 @@ func chunkDataIntoSecrets(data map[string]string) []map[string]string {
 	}
 	sort.Strings(keys)
 
-	chunks := []map[string]string{}
-	current := make(map[string]string)
+	chunks := []map[string]interface{}{}
+	current := make(map[string]interface{})
 	for _, k := range keys {
 		v := data[k]
 		// Check if this key-value pair alone exceeds the chunk size
-		testSingle := map[string]string{k: v}
+		testSingle := map[string]interface{}{k: v}
 		jsSingle, err := json.Marshal(testSingle)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: Failed to marshal single key-value: %v\n", err)
@@ -200,7 +192,7 @@ func chunkDataIntoSecrets(data map[string]string) []map[string]string {
 			return nil
 		}
 		// Normal chunking logic
-		test := make(map[string]string)
+		test := make(map[string]interface{})
 		for ck, cv := range current {
 			test[ck] = cv
 		}
@@ -212,7 +204,7 @@ func chunkDataIntoSecrets(data map[string]string) []map[string]string {
 		}
 		if getSecretSize(string(js)) > MaxSecretSizeBytes && len(current) > 0 {
 			chunks = append(chunks, current)
-			current = map[string]string{k: v}
+			current = map[string]interface{}{k: v}
 		} else {
 			current[k] = v
 		}
@@ -223,7 +215,7 @@ func chunkDataIntoSecrets(data map[string]string) []map[string]string {
 	return chunks
 }
 
-func createOrModifySecret(client *secretsmanager.Client, name string, data map[string]string, tags map[string]string) error {
+func createOrModifySecret(client *secretsmanager.Client, name string, data map[string]interface{}, tags map[string]string) error {
 	js, err := json.Marshal(data)
 	if err != nil {
 		return fmt.Errorf("failed to marshal secret data: %w", err)
@@ -249,7 +241,7 @@ func createOrModifySecret(client *secretsmanager.Client, name string, data map[s
 	return err
 }
 
-func redistributeSecrets(client *secretsmanager.Client, base string, chunks []map[string]string, tags map[string]string) error {
+func redistributeSecrets(client *secretsmanager.Client, base string, chunks []map[string]interface{}, tags map[string]string) error {
 	numbers, err := getMultipartNumbers(client, base)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: Failed to get multipart numbers for redistribution: %v\n", err)
@@ -316,15 +308,6 @@ func main() {
 	}
 	client := secretsmanager.NewFromConfig(cfg)
 
-	// Check if base secret exists
-	_, err = client.DescribeSecret(context.Background(), &secretsmanager.DescribeSecretInput{
-		SecretId: aws.String(baseSecretName),
-	})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Base secret '%s' does not exist or cannot be accessed: %v\n", baseSecretName, err)
-		os.Exit(1)
-	}
-
 	tags := map[string]string{
 		"temp:data-classification": "undefined",
 		"temp:compliance":          "undefined",
@@ -340,6 +323,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Check if base secret exists before proceeding
+	_, err = client.DescribeSecret(context.Background(), &secretsmanager.DescribeSecretInput{
+		SecretId: aws.String(baseSecretName),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Base secret '%s' does not exist. Please create the secret first before adding keys.\n", baseSecretName)
+		os.Exit(1)
+	}
 
 	allData, err := fetchAllSecretData(client, baseSecretName)
 	if err != nil {
