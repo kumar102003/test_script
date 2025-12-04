@@ -21,7 +21,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
-	"github.com/aws/aws-sdk-go-v2/service/secretsmanager/types"
 )
 
 const MaxSecretSizeBytes = 50 * 1024
@@ -48,81 +47,7 @@ func getSecretSize(data string) int {
 	return len([]byte(data))
 }
 
-func getMultipartNumbers(client *secretsmanager.Client, base string) ([]int, error) {
-	var numbers []int
-	input := &secretsmanager.ListSecretsInput{}
-	var nextToken *string
 
-	for {
-		input.NextToken = nextToken
-		resp, err := client.ListSecrets(context.Background(), input)
-		if err != nil {
-			return nil, err
-		}
-		for _, secret := range resp.SecretList {
-			name := aws.ToString(secret.Name)
-			if name == base {
-				numbers = append(numbers, 0)
-			} else if strings.HasPrefix(name, base+"-") {
-				part := strings.TrimPrefix(name, base+"-")
-				if isNumeric(part) {
-					num := 0
-					fmt.Sscanf(part, "%d", &num)
-					numbers = append(numbers, num)
-				}
-			}
-		}
-		if resp.NextToken == nil {
-			break
-		}
-		nextToken = resp.NextToken
-	}
-	return numbers, nil
-}
-
-func getSecretData(client *secretsmanager.Client, name string) (map[string]interface{}, error) {
-	input := &secretsmanager.GetSecretValueInput{SecretId: aws.String(name)}
-	resp, err := client.GetSecretValue(context.Background(), input)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to get secret '%s': %v\n", name, err)
-		return nil, err
-	}
-	var m map[string]interface{}
-	if err := json.Unmarshal([]byte(aws.ToString(resp.SecretString)), &m); err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to unmarshal secret '%s': %v\n", name, err)
-		return nil, err
-	}
-	return m, nil
-}
-
-func fetchAllSecretData(client *secretsmanager.Client, base string) (map[string]interface{}, error) {
-	all := make(map[string]interface{})
-	numbers, err := getMultipartNumbers(client, base)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to get multipart numbers for '%s': %v\n", base, err)
-		return nil, err
-	}
-	sort.Ints(numbers)
-	for _, n := range numbers {
-		var name string
-		if n == 0 {
-			name = base
-		} else {
-			name = fmt.Sprintf("%s-%d", base, n)
-		}
-		data, err := getSecretData(client, name)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: Failed to get secret data for '%s': %v\n", name, err)
-			return nil, err
-		}
-		if data != nil {
-			for k, v := range data {
-				all[k] = v
-			}
-		}
-	}
-	return all, nil
-}
 
 func addKeyValues(all map[string]interface{}, new map[string]interface{}) error {
 	for k := range new {
@@ -182,10 +107,10 @@ func chunkDataIntoSecrets(data map[string]interface{}) []map[string]interface{} 
 		v := data[k]
 		// Check if this key-value pair alone exceeds the chunk size
 		testSingle := map[string]interface{}{k: v}
-		jsSingle, err := json.Marshal(testSingle)
+		jsSingle, err := json.MarshalIndent(testSingle, "", "  ")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: Failed to marshal single key-value: %v\n", err)
-			continue
+			fmt.Fprintf(os.Stderr, "ERROR: Failed to marshal key '%s': %v\n", k, err)
+			return nil
 		}
 		if getSecretSize(string(jsSingle)) > MaxSecretSizeBytes {
 			fmt.Fprintf(os.Stderr, "ERROR: Key '%s' exceeds max chunk size (%d bytes): got %d\n", k, MaxSecretSizeBytes, getSecretSize(string(jsSingle)))
@@ -197,10 +122,10 @@ func chunkDataIntoSecrets(data map[string]interface{}) []map[string]interface{} 
 			test[ck] = cv
 		}
 		test[k] = v
-		js, err := json.Marshal(test)
+		js, err := json.MarshalIndent(test, "", "  ")
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: Failed to marshal chunk: %v\n", err)
-			continue
+			fmt.Fprintf(os.Stderr, "ERROR: Failed to marshal chunk with key '%s': %v\n", k, err)
+			return nil
 		}
 		if getSecretSize(string(js)) > MaxSecretSizeBytes && len(current) > 0 {
 			chunks = append(chunks, current)
@@ -213,76 +138,6 @@ func chunkDataIntoSecrets(data map[string]interface{}) []map[string]interface{} 
 		chunks = append(chunks, current)
 	}
 	return chunks
-}
-
-func createOrModifySecret(client *secretsmanager.Client, name string, data map[string]interface{}, tags map[string]string) error {
-	js, err := json.Marshal(data)
-	if err != nil {
-		return fmt.Errorf("failed to marshal secret data: %w", err)
-	}
-	input := &secretsmanager.DescribeSecretInput{SecretId: aws.String(name)}
-	_, err = client.DescribeSecret(context.Background(), input)
-	if err == nil {
-		_, err = client.UpdateSecret(context.Background(), &secretsmanager.UpdateSecretInput{
-			SecretId:     aws.String(name),
-			SecretString: aws.String(string(js)),
-		})
-		return err
-	}
-	tagsList := []types.Tag{}
-	for k, v := range tags {
-		tagsList = append(tagsList, types.Tag{Key: aws.String(k), Value: aws.String(v)})
-	}
-	_, err = client.CreateSecret(context.Background(), &secretsmanager.CreateSecretInput{
-		Name:         aws.String(name),
-		SecretString: aws.String(string(js)),
-		Tags:         tagsList,
-	})
-	return err
-}
-
-func redistributeSecrets(client *secretsmanager.Client, base string, chunks []map[string]interface{}, tags map[string]string) error {
-	numbers, err := getMultipartNumbers(client, base)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: Failed to get multipart numbers for redistribution: %v\n", err)
-		return err
-	}
-	sort.Ints(numbers)
-
-	if len(chunks) < len(numbers) {
-		return fmt.Errorf("number of new chunks (%d) is less than existing multipart secrets (%d). This would leave duplicated keys in extra secrets.", len(chunks), len(numbers))
-	}
-
-	maxNum := -1
-	if len(numbers) > 0 {
-		maxNum = numbers[len(numbers)-1]
-	}
-
-	for i, chunk := range chunks {
-		var name string
-		if i < len(numbers) {
-			if numbers[i] == 0 {
-				name = base
-			} else {
-				name = fmt.Sprintf("%s-%d", base, numbers[i])
-			}
-		} else {
-			// Use max(numbers) + (i - len(numbers) + 1) to ensure sequential numbering
-			// and to start with -1 if only base exists (maxNum=0 -> next is 1)
-			nextNum := maxNum + (i - len(numbers) + 1)
-			if nextNum == 0 {
-				name = base
-			} else {
-				name = fmt.Sprintf("%s-%d", base, nextNum)
-			}
-		}
-		err := createOrModifySecret(client, name, chunk, tags)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: Failed to create/modify secret '%s': %v\n", name, err)
-			return err
-		}
-	}
-	return nil
 }
 
 func main() {
@@ -307,6 +162,7 @@ func main() {
 		os.Exit(1)
 	}
 	client := secretsmanager.NewFromConfig(cfg)
+	sm := NewSecretManager(client)
 
 	tags := map[string]string{
 		"temp:data-classification": "undefined",
@@ -332,7 +188,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	allData, err := fetchAllSecretData(client, baseSecretName)
+	allData, err := sm.FetchAllSecretData(context.Background(), baseSecretName)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: failed to fetch existing secret data: %v\n", err)
 		os.Exit(1)
@@ -343,7 +199,11 @@ func main() {
 	}
 	sortedData := sortDataAlphabetically(allData)
 	chunks := chunkDataIntoSecrets(sortedData)
-	if err := redistributeSecrets(client, baseSecretName, chunks, tags); err != nil {
+	if chunks == nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Failed to chunk data into secrets. One or more keys may exceed the maximum secret size.\n")
+		os.Exit(1)
+	}
+	if err := sm.RedistributeSecrets(context.Background(), baseSecretName, chunks, tags); err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: failed to redistribute secrets: %v\n", err)
 		os.Exit(1)
 	}
