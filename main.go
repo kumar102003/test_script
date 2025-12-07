@@ -172,9 +172,12 @@ func main() {
 	env := flag.String("env", "", "The environment (e.g., staging, prod)")
 	secretName := flag.String("secret_name", "", "Base name of the secret")
 	jsonData := flag.String("json_data", "", "JSON data containing key-value pairs to add")
-	jsonPath := flag.String("json_path", "", "Optional JSON path (dot notation) to update nested keys (e.g., 'Cred.Db')")
+	jsonPathRaw := flag.String("json_path", "", "Optional JSON path (dot notation) to update nested keys (e.g., 'Cred.Db')")
 	forceUpdate := flag.Bool("force_update", false, "Enable update mode. If true, updates existing keys (fails if missing). If false, adds new keys (fails if exists).")
 	flag.Parse()
+
+	// Trim quotes from jsonPath if present (handles double-quoted arguments from shell)
+	jsonPath := strings.Trim(*jsonPathRaw, "\"")
 
 	if *env == "" || *secretName == "" || *jsonData == "" {
 		fmt.Fprintf(os.Stderr, "ERROR: --env, --secret_name, and --json_data are required\n")
@@ -230,8 +233,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *jsonPath != "" {
-		if err := addSecretToGivenPath(allData, newData, *jsonPath, *forceUpdate); err != nil {
+	if jsonPath != "" {
+		if err := addSecretToGivenPath(allData, newData, jsonPath, *forceUpdate); err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: failed to update nested keys: %v\n", err)
 			os.Exit(1)
 		}
