@@ -54,7 +54,10 @@ func (sm *SecretManager) GetMultipartNumbers(ctx context.Context, base string) (
 				part := strings.TrimPrefix(name, base+"-")
 				if isNumeric(part) {
 					num := 0
-					fmt.Sscanf(part, "%d", &num)
+					_, err := fmt.Sscanf(part, "%d", &num)
+					if err != nil {
+						return nil, fmt.Errorf("failed to parse part number from secret '%s': %w", name, err)
+					}
 					numbers = append(numbers, num)
 				}
 			}
@@ -82,12 +85,9 @@ func (sm *SecretManager) GetSecretData(ctx context.Context, name string) (map[st
 }
 
 // FetchAllSecretData fetches all secret data across multipart secrets
-func (sm *SecretManager) FetchAllSecretData(ctx context.Context, base string) (map[string]interface{}, error) {
+// numbers: pre-fetched list of multipart numbers (0 = base secret, 1 = base-1, etc.)
+func (sm *SecretManager) FetchAllSecretData(ctx context.Context, base string, numbers []int) (map[string]interface{}, error) {
 	all := make(map[string]interface{})
-	numbers, err := sm.GetMultipartNumbers(ctx, base)
-	if err != nil {
-		return nil, err
-	}
 	sort.Ints(numbers)
 	for _, n := range numbers {
 		var name string
@@ -103,6 +103,9 @@ func (sm *SecretManager) FetchAllSecretData(ctx context.Context, base string) (m
 		}
 		if data != nil {
 			for k, v := range data {
+				if _, exists := all[k]; exists {
+					return nil, fmt.Errorf("duplicate key '%s' found in secret part '%s'", k, name)
+				}
 				all[k] = v
 			}
 		}
@@ -125,7 +128,7 @@ func (sm *SecretManager) CreateOrModifySecret(ctx context.Context, name string, 
 		})
 		return err
 	}
-	tagsList := []types.Tag{}
+	tagsList := make([]types.Tag, 0, len(tags))
 	for k, v := range tags {
 		tagsList = append(tagsList, types.Tag{Key: aws.String(k), Value: aws.String(v)})
 	}
@@ -138,11 +141,8 @@ func (sm *SecretManager) CreateOrModifySecret(ctx context.Context, name string, 
 }
 
 // RedistributeSecrets redistributes chunks across multipart secrets
-func (sm *SecretManager) RedistributeSecrets(ctx context.Context, base string, chunks []map[string]interface{}, tags map[string]string) error {
-	numbers, err := sm.GetMultipartNumbers(ctx, base)
-	if err != nil {
-		return err
-	}
+// numbers: pre-fetched list of multipart numbers (0 = base secret, 1 = base-1, etc.)
+func (sm *SecretManager) RedistributeSecrets(ctx context.Context, base string, chunks []map[string]interface{}, tags map[string]string, numbers []int) error {
 	sort.Ints(numbers)
 	if len(chunks) < len(numbers) {
 		return fmt.Errorf("number of new chunks (%d) is less than existing multipart secrets (%d). This would leave duplicated keys in extra secrets. Please manually delete extra secrets or check your input", len(chunks), len(numbers))
@@ -160,14 +160,10 @@ func (sm *SecretManager) RedistributeSecrets(ctx context.Context, base string, c
 				name = fmt.Sprintf("%s-%d", base, numbers[i])
 			}
 		} else {
-			// Use max(numbers) + (i - len(numbers) + 1) to ensure sequential numbering
-			// and to start with 1 if only base exists (maxNum=0 -> next is 1)
-			nextNum := maxNum + (i - len(numbers) + 1)
-			if nextNum == 0 {
-				name = base
-			} else {
-				name = fmt.Sprintf("%s-%d", base, nextNum)
-			}
+			// Create new secrets sequentially after the highest existing number
+			nextNum := maxNum + 1
+			name = fmt.Sprintf("%s-%d", base, nextNum)
+			maxNum = nextNum
 		}
 		err := sm.CreateOrModifySecret(ctx, name, chunk, tags)
 		if err != nil {
