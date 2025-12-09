@@ -6,8 +6,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
-	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
@@ -19,6 +19,7 @@ import (
 type SecretsManagerClient interface {
 	ListSecrets(ctx context.Context, params *secretsmanager.ListSecretsInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.ListSecretsOutput, error)
 	GetSecretValue(ctx context.Context, params *secretsmanager.GetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.GetSecretValueOutput, error)
+	BatchGetSecretValue(ctx context.Context, params *secretsmanager.BatchGetSecretValueInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.BatchGetSecretValueOutput, error)
 	DescribeSecret(ctx context.Context, params *secretsmanager.DescribeSecretInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.DescribeSecretOutput, error)
 	CreateSecret(ctx context.Context, params *secretsmanager.CreateSecretInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.CreateSecretOutput, error)
 	UpdateSecret(ctx context.Context, params *secretsmanager.UpdateSecretInput, optFns ...func(*secretsmanager.Options)) (*secretsmanager.UpdateSecretOutput, error)
@@ -40,6 +41,9 @@ func (sm *SecretManager) GetMultipartNumbers(ctx context.Context, base string) (
 	input := &secretsmanager.ListSecretsInput{}
 	var nextToken *string
 
+	// Regex to match base-[1-5] pattern
+	multipartRegex := regexp.MustCompile(regexp.QuoteMeta(base) + -([1-5])$)
+
 	for {
 		input.NextToken = nextToken
 		resp, err := sm.client.ListSecrets(ctx, input)
@@ -49,17 +53,16 @@ func (sm *SecretManager) GetMultipartNumbers(ctx context.Context, base string) (
 		for _, secret := range resp.SecretList {
 			name := aws.ToString(secret.Name)
 			if name == base {
+				// Exact match = base secret
 				numbers = append(numbers, 0)
-			} else if strings.HasPrefix(name, base+"-") {
-				part := strings.TrimPrefix(name, base+"-")
-				if isNumeric(part) {
-					num := 0
-					_, err := fmt.Sscanf(part, "%d", &num)
-					if err != nil {
-						return nil, fmt.Errorf("failed to parse part number from secret '%s': %w", name, err)
-					}
-					numbers = append(numbers, num)
+			} else if match := multipartRegex.FindStringSubmatch(name); match != nil {
+				// Regex match = multipart secret
+				num := 0
+				_, err := fmt.Sscanf(match[1], "%d", &num)
+				if err != nil {
+					return nil, fmt.Errorf("failed to parse part number from secret '%s': %w", name, err)
 				}
+				numbers = append(numbers, num)
 			}
 		}
 		if resp.NextToken == nil {
@@ -70,44 +73,73 @@ func (sm *SecretManager) GetMultipartNumbers(ctx context.Context, base string) (
 	return numbers, nil
 }
 
-// GetSecretData retrieves secret data by name
-func (sm *SecretManager) GetSecretData(ctx context.Context, name string) (map[string]interface{}, error) {
-	input := &secretsmanager.GetSecretValueInput{SecretId: aws.String(name)}
-	resp, err := sm.client.GetSecretValue(ctx, input)
+// GetSecretsData fetches multiple secrets in a single batch call using BatchGetSecretValue
+// We can safely fetch up to max 5 multipart secrets (within AWS limit of 20)
+func (sm *SecretManager) GetSecretsData(ctx context.Context, secretNames []string) (map[string]string, error) {
+	if len(secretNames) == 0 {
+		return nil, fmt.Errorf("no secret names provided to fetch")
+	}
+
+	resp, err := sm.client.BatchGetSecretValue(ctx, &secretsmanager.BatchGetSecretValueInput{
+		SecretIdList: secretNames,
+	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to batch get secret values: %w", err)
 	}
-	var m map[string]interface{}
-	if err := json.Unmarshal([]byte(aws.ToString(resp.SecretString)), &m); err != nil {
-		return nil, err
+
+	result := make(map[string]string)
+	for _, secret := range resp.SecretValues {
+		result[aws.ToString(secret.Name)] = aws.ToString(secret.SecretString)
 	}
-	return m, nil
+	return result, nil
 }
 
-// FetchAllSecretData fetches all secret data across multipart secrets
+// FetchAllSecretData fetches all secret data across multipart secrets using batch API
 // numbers: pre-fetched list of multipart numbers (0 = base secret, 1 = base-1, etc.)
 func (sm *SecretManager) FetchAllSecretData(ctx context.Context, base string, numbers []int) (map[string]interface{}, error) {
-	all := make(map[string]interface{})
-	sort.Ints(numbers)
+	if len(numbers) == 0 {
+		return make(map[string]interface{}), nil
+	}
+
+	// Build list of secret names to fetch
+	secretNames := make([]string, 0, len(numbers))
 	for _, n := range numbers {
-		var name string
 		if n == 0 {
-			name = base
+			secretNames = append(secretNames, base)
 		} else {
-			name = fmt.Sprintf("%s-%d", base, n)
+			secretNames = append(secretNames, fmt.Sprintf("%s-%d", base, n))
 		}
-		data, err := sm.GetSecretData(ctx, name)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "ERROR: Failed to get secret data for '%s': %v\n", name, err)
-			return nil, err
+	}
+
+	// Fetch all secrets in a single batch call
+	secretsData, err := sm.GetSecretsData(ctx, secretNames)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Failed to batch fetch secret data: %v\n", err)
+		return nil, err
+	}
+
+	// Merge all secret data into a single map
+	all := make(map[string]interface{})
+	for _, secretName := range secretNames {
+		secretValue, exists := secretsData[secretName]
+		if !exists {
+			return nil, fmt.Errorf("secret '%s' not found in batch response", secretName)
 		}
+
+		var data map[string]interface{}
+		if err := json.Unmarshal([]byte(secretValue), &data); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal secret '%s': %w", secretName, err)
+		}
+
 		if data != nil {
 			for k, v := range data {
 				if _, exists := all[k]; exists {
-					return nil, fmt.Errorf("duplicate key '%s' found in secret part '%s'", k, name)
+					return nil, fmt.Errorf("duplicate key '%s' found in secret part '%s'", k, secretName)
 				}
 				all[k] = v
 			}
+		} else {
+			return nil, fmt.Errorf("secret '%s' contains empty/null JSON data", secretName)
 		}
 	}
 	return all, nil

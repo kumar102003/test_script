@@ -15,32 +15,28 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"github.com/tidwall/gjson"
 )
 
 const MaxSecretSizeBytes = 50 * 1024
 
+var (
+	multipartSuffix = regexp.MustCompile(-[1-5]$)
+)
+
 func verifySecretName(secretName string) (string, error) {
 	clean := strings.TrimSpace(secretName)
-	parts := strings.Split(clean, "-")
-	if len(parts) > 1 && isNumeric(parts[len(parts)-1]) {
+	if multipartSuffix.MatchString(clean) {
 		return "", fmt.Errorf("multipart secret name provided: %s. Please provide the base secret name instead", clean)
 	}
 	return clean, nil
-}
-
-func isNumeric(s string) bool {
-	for _, r := range s {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return len(s) > 0
 }
 
 func getSecretSize(data string) int {
@@ -133,7 +129,7 @@ func chunkDataIntoSecrets(data map[string]interface{}) ([]map[string]interface{}
 func addSecretToGivenPath(all map[string]interface{}, new map[string]interface{}, jsonPath string, forceUpdate bool) error {
 	parts := strings.Split(jsonPath, ".")
 	current := all
-	
+
 	// Traverse to the parent of the target key
 	for i := 0; i < len(parts); i++ {
 		key := parts[i]
@@ -168,19 +164,65 @@ func addSecretToGivenPath(all map[string]interface{}, new map[string]interface{}
 	return nil
 }
 
+// findKey searches for a key in multipart secrets and returns which one contains it
+// fullPath is dot-notation path like "Db.Cred.Username" or just "username"
+func findKey(ctx context.Context, sm *SecretManager, base string, numbers []int, fullPath string) error {
+	// Build list of secret names to fetch
+	secretNames := make([]string, 0, len(numbers))
+	for _, n := range numbers {
+		if n == 0 {
+			secretNames = append(secretNames, base)
+		} else {
+			secretNames = append(secretNames, fmt.Sprintf("%s-%d", base, n))
+		}
+	}
+
+	// Fetch all secrets in a single batch call
+	secretsData, err := sm.GetSecretsData(ctx, secretNames)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: Failed to fetch secrets: %v\n", err)
+		return err
+	}
+
+	// Search for the key in each secret
+	for _, secretName := range secretNames {
+		secretValue, exists := secretsData[secretName]
+		if !exists {
+			return fmt.Errorf("secret '%s' not found in batch response. ", secretName)
+		}
+
+		// Use gjson to check if the path exists
+		result := gjson.Get(secretValue, fullPath)
+		if result.Exists() {
+			fmt.Printf("✅ Key '%s' found in: %s\n", fullPath, secretName)
+			return nil
+		}
+	}
+
+	fmt.Printf("❌ Key '%s' not found\n", fullPath)
+	return nil
+}
+
 func main() {
 	env := flag.String("env", "", "The environment (e.g., staging, prod)")
 	secretName := flag.String("secret_name", "", "Base name of the secret")
 	jsonData := flag.String("json_data", "", "JSON data containing key-value pairs to add")
-	jsonPathRaw := flag.String("json_path", "", "Optional JSON path (dot notation) to update nested keys (e.g., 'Cred.Db')")
+	jsonPath := flag.String("json_path", "", "Dot notation path for operations (e.g., 'Cred.Db.Username' for find, 'Cred.Db' for add nested). For add/update: path to nested object. For find: full path to key.")
 	forceUpdate := flag.Bool("force_update", false, "Enable update mode. If true, updates existing keys (fails if missing). If false, adds new keys (fails if exists).")
+	findKeyMode := flag.Bool("find-key", false, "Find mode: Search for key specified in --json_path across multipart secrets")
 	flag.Parse()
 
-	// Trim quotes from jsonPath if present (handles double-quoted arguments from shell)
-	jsonPath := strings.Trim(*jsonPathRaw, "\"")
-
-	if *env == "" || *secretName == "" || *jsonData == "" {
-		fmt.Fprintf(os.Stderr, "ERROR: --env, --secret_name, and --json_data are required\n")
+	// Validate required flags
+	if *env == "" || *secretName == "" || (*jsonData == "" && !*findKeyMode) || (*jsonData != "" && *findKeyMode) || (*findKeyMode && *jsonPath == "") {
+		if *env == "" || *secretName == "" {
+			fmt.Fprintf(os.Stderr, "ERROR: --env and --secret_name are required\n")
+		} else if *jsonData == "" && !*findKeyMode {
+			fmt.Fprintf(os.Stderr, "ERROR: Either --json_data (for add/update) or --find-key (for find mode) is required\n")
+		} else if *jsonData != "" && *findKeyMode {
+			fmt.Fprintf(os.Stderr, "ERROR: Cannot use both --json_data and --find-key together\n")
+		} else if *findKeyMode && *jsonPath == "" {
+			fmt.Fprintf(os.Stderr, "ERROR: --json_path is required in find-key mode (e.g., 'username' or 'Db.Cred.Username')\n")
+		}
 		os.Exit(1)
 	}
 
@@ -198,17 +240,8 @@ func main() {
 	sm := NewSecretManager(client)
 
 	tags := map[string]string{
-		"temp:data-classification": "undefined",
-		"temp:compliance":          "undefined",
-		"temp:env":                 *env,
-		"temp:resource":            "aws_secretsmanager_secret",
-		"temp:feature":             "multipart_secrets",
-	}
-
-	newData, err := parseJSONInput(*jsonData)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
-		os.Exit(1)
+		"temp:env":     *env,
+		"temp:feature": "multipart_secrets",
 	}
 
 	// Check if base secret exists before proceeding
@@ -227,14 +260,30 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Find-key mode
+	if *findKeyMode {
+		if err := findKey(context.Background(), sm, baseSecretName, numbers, *jsonPath); err != nil {
+			fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	newData, err := parseJSONInput(*jsonData)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR: %v\n", err)
+		os.Exit(1)
+	}
+
+	// It returns combined Map containing all keys from  Multipart secrtes .
 	allData, err := sm.FetchAllSecretData(context.Background(), baseSecretName, numbers)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR: failed to fetch existing secret data: %v\n", err)
 		os.Exit(1)
 	}
 
-	if jsonPath != "" {
-		if err := addSecretToGivenPath(allData, newData, jsonPath, *forceUpdate); err != nil {
+	if *jsonPath != "" {
+		if err := addSecretToGivenPath(allData, newData, *jsonPath, *forceUpdate); err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR: failed to update nested keys: %v\n", err)
 			os.Exit(1)
 		}
