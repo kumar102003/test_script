@@ -28,7 +28,7 @@ import (
 const MaxSecretSizeBytes = 50 * 1024
 
 var (
-	multipartSuffix = regexp.MustCompile(-[1-5]$)
+	multipartSuffix = regexp.MustCompile("-[1-5]$")
 )
 
 func verifySecretName(secretName string) (string, error) {

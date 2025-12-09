@@ -42,7 +42,7 @@ func (sm *SecretManager) GetMultipartNumbers(ctx context.Context, base string) (
 	var nextToken *string
 
 	// Regex to match base-[1-5] pattern
-	multipartRegex := regexp.MustCompile(regexp.QuoteMeta(base) + -([1-5])$)
+	multipartRegex := regexp.MustCompile(regexp.QuoteMeta(base) + `-[1-5]$`)
 
 	for {
 		input.NextToken = nextToken
