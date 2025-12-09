@@ -6,6 +6,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.40.0
 	github.com/aws/aws-sdk-go-v2/config v1.32.2
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.40.2
+	github.com/tidwall/gjson v1.18.0
 )
 
 require (
@@ -21,4 +22,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.10 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.41.2 // indirect
 	github.com/aws/smithy-go v1.23.2 // indirect
+	github.com/tidwall/match v1.1.1 // indirect
+	github.com/tidwall/pretty v1.2.0 // indirect
 )
