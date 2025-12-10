@@ -6,8 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"regexp"
 	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
@@ -36,13 +37,18 @@ func NewSecretManager(client SecretsManagerClient) *SecretManager {
 }
 
 // GetMultipartNumbers retrieves all part numbers for a base secret name
+// Uses AWS Secrets Manager prefix filtering to reduce the result set
 func (sm *SecretManager) GetMultipartNumbers(ctx context.Context, base string) ([]int, error) {
 	var numbers []int
-	input := &secretsmanager.ListSecretsInput{}
+	input := &secretsmanager.ListSecretsInput{
+		Filters: []types.Filter{
+			{
+				Key:    types.FilterNameStringTypeName,
+				Values: []string{base},
+			},
+		},
+	}
 	var nextToken *string
-
-	// Regex to match base-[1-5] pattern
-	multipartRegex := regexp.MustCompile(regexp.QuoteMeta(base) + "-([1-5])$")
 
 	for {
 		input.NextToken = nextToken
@@ -50,21 +56,21 @@ func (sm *SecretManager) GetMultipartNumbers(ctx context.Context, base string) (
 		if err != nil {
 			return nil, err
 		}
+
 		for _, secret := range resp.SecretList {
 			name := aws.ToString(secret.Name)
+
 			if name == base {
-				// Exact match = base secret
 				numbers = append(numbers, 0)
-			} else if match := multipartRegex.FindStringSubmatch(name); match != nil {
-				// Regex match = multipart secret
-				num := 0
-				_, err := fmt.Sscanf(match[1], "%d", &num)
-				if err != nil {
-					return nil, fmt.Errorf("failed to parse part number from secret '%s': %w", name, err)
+			} else if strings.HasPrefix(name, base+"-") {
+				suffix := strings.TrimPrefix(name, base+"-")
+				num, err := strconv.Atoi(suffix)
+				if err == nil && num >= 1 && num <= 5 {
+					numbers = append(numbers, num)
 				}
-				numbers = append(numbers, num)
 			}
 		}
+
 		if resp.NextToken == nil {
 			break
 		}

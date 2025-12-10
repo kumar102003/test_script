@@ -28,7 +28,7 @@ import (
 const MaxSecretSizeBytes = 50 * 1024
 
 var (
-	multipartSuffix = regexp.MustCompile(`-[1-5]$`)
+	multipartSuffix = regexp.MustCompile("[1-5]$")
 )
 
 func verifySecretName(secretName string) (string, error) {
@@ -99,7 +99,7 @@ func chunkDataIntoSecrets(data map[string]interface{}) ([]map[string]interface{}
 			return nil, fmt.Errorf("failed to marshal key '%s': %w", k, err)
 		}
 		if getSecretSize(string(jsSingle)) > MaxSecretSizeBytes {
-			return nil, fmt.Errorf("key '%s' exceeds max chunk size (%d bytes): got %d", k, MaxSecretSizeBytes, getSecretSize(string(jsSingle)))
+			return nil, fmt.Errorf("key '%s' exceeds max chunk size (%d bytes): got %d. This data cannot be stored in secrets manager even as an individual secret as this hits the max limit supported by AWS", k, MaxSecretSizeBytes, getSecretSize(string(jsSingle)))
 		}
 		// Trial-based size check: test if adding new key would exceed limit
 		test := make(map[string]interface{}) // Create empty temporary map
